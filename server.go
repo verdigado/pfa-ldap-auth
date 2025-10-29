@@ -27,6 +27,7 @@ func main() {
 
 	routes := ldap.NewRouteMux()
 	routes.Bind(handleBind)
+	routes.Search(handleSearch).Label("Search - Generic")
 	server.Handle(routes)
 	go server.ListenAndServe(string(*listenAddr))
 	ch := make(chan os.Signal)
@@ -40,14 +41,42 @@ func main() {
 func handleBind(w ldap.ResponseWriter, m *ldap.Message) {
 	r := m.GetBindRequest()
 	res := ldap.NewBindResponse(ldap.LDAPResultSuccess)
+	if r.AuthenticationChoice() == "simple" {
+		if string(r.Name()) == "login" {
+			w.Write(res)
+			return
+		}
+		log.Printf("Bind failed User=%s, Pass=%#v", string(r.Name()), r.Authentication())
+		res.SetResultCode(ldap.LDAPResultInvalidCredentials)
+		res.SetDiagnosticMessage("invalid credentials")
+	} else {
+		res.SetResultCode(ldap.LDAPResultUnwillingToPerform)
+		res.SetDiagnosticMessage("Authentication choice not supported")
+	}
+	w.Write(res)
+}
 
-	if string(r.Name()) == "myLogin" {
-		w.Write(res)
+func handleSearch(w ldap.ResponseWriter, m *ldap.Message) {
+	r := m.GetSearchRequest()
+	log.Printf("Request BaseDn=%s", r.BaseObject())
+	log.Printf("Request Filter=%s", r.Filter())
+	log.Printf("Request FilterString=%s", r.FilterString())
+	log.Printf("Request Attributes=%s", r.Attributes())
+	log.Printf("Request TimeLimit=%d", r.TimeLimit().Int())
+
+	select {
+	case <-m.Done:
+		log.Print("Leaving handleSearch...")
 		return
+	default:
 	}
 
-	log.Printf("Bind failed User=%s, Pass=%s", string(r.Name()), string(r.AuthenticationSimple()))
-	res.SetResultCode(ldap.LDAPResultInvalidCredentials)
-	res.SetDiagnosticMessage("invalid credentials")
+	e := ldap.NewSearchResultEntry("cn=mail@test.example," + string(r.BaseObject()))
+	e.AddAttribute("mail", "mail@test.example")
+	e.AddAttribute("cn", "Test User")
+	w.Write(e)
+
+	res := ldap.NewSearchResultDoneResponse(ldap.LDAPResultSuccess)
 	w.Write(res)
+
 }
