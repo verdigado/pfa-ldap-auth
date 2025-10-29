@@ -7,19 +7,18 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	_ "github.com/go-sql-driver/mysql"
 	ldap "github.com/vjeantet/ldapserver"
+	"golang.org/x/crypto/bcrypt"
 )
 
 var (
 	listenAddr     = flag.String("listen", "127.0.0.1:1389", "LDAP listen address (host:port).")
-	baseDN         = flag.String("baseDN", "dc=example,dc=com", "Base DN for your LDAP tree.")
 	dbDriver       = flag.String("db-driver", "mysql", "SQL driver name (mysql or postgres).")
 	dbDSN          = flag.String("db-dsn", "", "Database DSN. Example MySQL: user:pass@tcp(localhost:3306)/postfixadmin")
-	bindAttr       = flag.String("bind-attr", "uid", "DN attribute to use as username (e.g. uid, mail, cn). For binds, server will extract this from Bind DN.")
-	userQuery      = flag.String("user-query", "", "SQL query to fetch user. Use one parameter placeholder. Default depends on driver.")
 	passwordFormat = flag.String("password-format", "", "Force a password format (cleartext|md5|sha1|bcrypt). If empty, server tries to read password_format column (if available).")
 )
 
@@ -42,21 +41,42 @@ func main() {
 }
 
 func getDatabase() sql.DB {
-	db, err := sql.Open("mysql", "username:password@tcp(127.0.0.1:3306)/dbname")
+	db, err := sql.Open(*dbDriver, *dbDSN)
 	if err != nil {
 		panic(err.Error())
 	}
 	return *db
 }
 
-func comparePasswordHash(username string, password string) bool {
+func getPasswordHash(username string) string {
 	var db = getDatabase()
 	var password_hash string
-	err := db.QueryRow("SELECT username, password FROM users WHERE username = ?", username).Scan(password_hash)
+	err := db.QueryRow("SELECT password FROM mailbox WHERE username = ?", username).Scan(&password_hash)
 	if err != nil {
 		log.Fatal(err)
 	}
-	return true
+	return password_hash
+}
+
+func compareSha5123Crypt(password_hash string, password string) bool {
+	//err := crypt.Crypter.Verify(password_hash, []byte(password))
+	return false
+}
+
+func compareBlfCrypt(password_hash string, password string) bool {
+	bcrypt.CompareHashAndPassword([]byte(password_hash), []byte(password))
+	return false
+}
+
+func comparePasswordHash(username string, password string) bool {
+	var password_hash string = getPasswordHash(username)
+	var blf_prefix bool = strings.HasPrefix(password_hash, "{BLF-CRYPT}")
+	if blf_prefix {
+		return compareBlfCrypt(password_hash, password)
+	} else if strings.HasPrefix(password_hash, "{SHA512-CRYPT}") {
+		return compareSha5123Crypt(password_hash, password)
+	}
+	return false
 }
 
 func handleBind(w ldap.ResponseWriter, m *ldap.Message) {
@@ -68,10 +88,13 @@ func handleBind(w ldap.ResponseWriter, m *ldap.Message) {
 			return
 		}
 		var user_password string = fmt.Sprintf("%#v", r.Authentication())
-		log.Printf("Bind failed User=%s, Pass=%s", string(r.Name()), user_password)
-		comparePasswordHash(string(r.Name()), user_password)
-		res.SetResultCode(ldap.LDAPResultInvalidCredentials)
-		res.SetDiagnosticMessage("invalid credentials")
+		log.Printf("Binding User=%s, Pass=%s", string(r.Name()), user_password)
+		if !comparePasswordHash(string(r.Name()), user_password) {
+			res.SetResultCode(ldap.LDAPResultInvalidCredentials)
+			res.SetDiagnosticMessage("invalid credentials")
+		} else {
+			log.Printf("Login succeeded.")
+		}
 	} else {
 		res.SetResultCode(ldap.LDAPResultUnwillingToPerform)
 		res.SetDiagnosticMessage("Authentication choice not supported")
