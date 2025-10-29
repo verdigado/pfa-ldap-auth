@@ -1,12 +1,15 @@
 package main
 
 import (
+	"database/sql"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
 
+	_ "github.com/go-sql-driver/mysql"
 	ldap "github.com/vjeantet/ldapserver"
 )
 
@@ -38,6 +41,24 @@ func main() {
 	server.Stop()
 }
 
+func getDatabase() sql.DB {
+	db, err := sql.Open("mysql", "username:password@tcp(127.0.0.1:3306)/dbname")
+	if err != nil {
+		panic(err.Error())
+	}
+	return *db
+}
+
+func comparePasswordHash(username string, password string) bool {
+	var db = getDatabase()
+	var password_hash string
+	err := db.QueryRow("SELECT username, password FROM users WHERE username = ?", username).Scan(password_hash)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return true
+}
+
 func handleBind(w ldap.ResponseWriter, m *ldap.Message) {
 	r := m.GetBindRequest()
 	res := ldap.NewBindResponse(ldap.LDAPResultSuccess)
@@ -46,7 +67,9 @@ func handleBind(w ldap.ResponseWriter, m *ldap.Message) {
 			w.Write(res)
 			return
 		}
-		log.Printf("Bind failed User=%s, Pass=%#v", string(r.Name()), r.Authentication())
+		var user_password string = fmt.Sprintf("%#v", r.Authentication())
+		log.Printf("Bind failed User=%s, Pass=%s", string(r.Name()), user_password)
+		comparePasswordHash(string(r.Name()), user_password)
 		res.SetResultCode(ldap.LDAPResultInvalidCredentials)
 		res.SetDiagnosticMessage("invalid credentials")
 	} else {
