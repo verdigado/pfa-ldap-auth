@@ -11,6 +11,7 @@ import (
 	"net/mail"
 	"os"
 	"os/signal"
+	"regexp"
 	"strings"
 	"syscall"
 	"unicode/utf8"
@@ -31,11 +32,42 @@ var (
 )
 
 type Mailbox struct {
-	Username  string
-	Domain    string
-	Localpart string
-	Name      string
-	Dn        string
+	Dn         string
+	Username   string
+	Domain     string
+	Localpart  string
+	Name       string
+	objectGUID string
+}
+
+type MailboxList struct {
+	UUID    string
+	Mailbox string
+}
+
+var mailboxMap []MailboxList
+
+func addMailboxMapEntry(uuid, mailbox string) {
+	mailboxMap = append(mailboxMap, MailboxList{UUID: uuid, Mailbox: mailbox})
+}
+
+func getMailboxMapEntry(uuid string) (string, bool) {
+	for _, e := range mailboxMap {
+		if e.UUID == uuid {
+			return e.Mailbox, true
+		}
+	}
+	return "", false
+}
+
+func deleteMailboxMapEntry(uuid string) bool {
+	for i, e := range mailboxMap {
+		if e.UUID == uuid {
+			mailboxMap = append(mailboxMap[:i], mailboxMap[i+1:]...)
+			return true
+		}
+	}
+	return false
 }
 
 func main() {
@@ -74,9 +106,17 @@ func getPasswordHash(username string) string {
 	return password_hash
 }
 
-func getMailboxes() ([]Mailbox, error) {
+func getAllDbMailboxes(filter string) ([]Mailbox, error) {
 	var db = getDatabase()
-	rows, err := db.Query("SELECT username, domain, local_part, name FROM mailbox")
+	filter_mail := ExtractMail(filter)
+	query := "SELECT username, domain, local_part, name FROM mailbox"
+	if len(filter_mail) > 0 {
+		query += " WHERE username LIKE '%" + filter_mail + "%'"
+	}
+	if *debugMode == "true" {
+		query += " LIMIT 10"
+	}
+	rows, err := db.Query(query)
 	if err != nil {
 		log.Print("Failed to execute query")
 		return nil, err
@@ -88,11 +128,21 @@ func getMailboxes() ([]Mailbox, error) {
 		var m Mailbox
 		if err := rows.Scan(&m.Username, &m.Domain, &m.Localpart, &m.Name); err != nil {
 			log.Print("Failed to scan query result")
-			return nil, err
+			continue
 		}
-		m.Dn, err = MailboxToDN(m.Localpart + "@" + m.Domain)
+		m.Dn, err = MailboxToDN(m.Username)
 		if err != nil {
-			log.Printf("Failed to get Mailbox DN: %s", err)
+			log.Printf("Failed to get Mailbox DN (%s): %s", m.Username, err)
+			continue
+		}
+		if m.Localpart != "*" && m.Localpart != "" && m.Localpart != " " {
+			m.objectGUID = UUIDv4FromString(m.Username)
+		} else {
+			log.Printf("Failed to UUID (%s): %s", m.Username, err)
+			continue
+		}
+		if *debugMode == "true" {
+			log.Printf("%s %s %s", m.Username, m.objectGUID, m.Dn)
 		}
 		result = append(result, m)
 	}
@@ -155,39 +205,38 @@ func handleBind(w ldap.ResponseWriter, m *ldap.Message) {
 	w.Write(res)
 }
 
+func ExtractMail(filter string) string {
+	var mailRe = regexp.MustCompile(`mail=([^*^)]+)`)
+	if m := mailRe.FindStringSubmatch(filter); len(m) > 1 {
+		return m[1]
+	}
+	return ""
+}
+
 func handleSearch(w ldap.ResponseWriter, m *ldap.Message) {
 	r := m.GetSearchRequest()
 
 	if *debugMode == "true" {
-		log.Printf("Request BaseDn=%s", r.BaseObject())
-		log.Printf("Request Filter=%s", r.Filter())
+		//log.Printf("Request BaseDn=%s", r.BaseObject())
+		//log.Printf("Request Filter=%s", r.Filter())
 		log.Printf("Request FilterString=%s", r.FilterString())
-		log.Printf("Request Attributes=%s", r.Attributes())
-		log.Printf("Request TimeLimit=%d", r.TimeLimit().Int())
+		//log.Printf("Request Attributes=%s", r.Attributes())
+		//log.Printf("Request TimeLimit=%d", r.TimeLimit().Int())
 	}
-
-	addresses, err := getMailboxes()
+	addresses, err := getAllDbMailboxes(r.FilterString())
 	if err != nil {
 		log.Print("failed to get mail addresses")
+	} else {
+		log.Printf("Received %d results", len(addresses))
 	}
-	for index, mailbox := range addresses {
-		if mailbox.Localpart != "*" && mailbox.Localpart != "" && mailbox.Localpart != " " {
-			e := ldap.NewSearchResultEntry(mailbox.Dn)
-			var objectGUID = UUIDv4FromString(mailbox.Username)
-			e.AddAttribute("mail", message.AttributeValue(mailbox.Username))
-			e.AddAttribute("cn", message.AttributeValue(mailbox.Username))
-			e.AddAttribute("displayName", message.AttributeValue(mailbox.Name))
-			e.AddAttribute("objectGUID", message.AttributeValue(objectGUID))
-			w.Write(e)
-			if *debugMode == "true" {
-				fmt.Printf("%d %s %s %s", index, mailbox.Localpart, mailbox.Domain, objectGUID)
-			}
-		}
-		if *debugMode == "true" && index == 10 {
-			break
-		}
+	for _, mailbox := range addresses {
+		e := ldap.NewSearchResultEntry(mailbox.Dn)
+		e.AddAttribute("mail", message.AttributeValue(mailbox.Username))
+		e.AddAttribute("cn", message.AttributeValue(mailbox.Username))
+		e.AddAttribute("displayName", message.AttributeValue(mailbox.Name))
+		e.AddAttribute("objectGUID", message.AttributeValue(mailbox.objectGUID))
+		w.Write(e)
 	}
-
 	res := ldap.NewSearchResultDoneResponse(ldap.LDAPResultSuccess)
 	w.Write(res)
 
