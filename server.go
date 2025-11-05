@@ -108,10 +108,10 @@ func getPasswordHash(username string) string {
 
 func getAllDbMailboxes(filter string) ([]Mailbox, error) {
 	var db = getDatabase()
-	filter_mail := ExtractMail(filter)
+	filter_key, filter_value, filter_err := ExtractFilter(filter)
 	query := "SELECT username, domain, local_part, name FROM mailbox"
-	if len(filter_mail) > 0 {
-		query += " WHERE username LIKE '%" + filter_mail + "%'"
+	if filter_err == nil {
+		query += " WHERE " + filter_key + " LIKE '%" + filter_value + "%'"
 	}
 	if *debugMode == "true" {
 		query += " LIMIT 10"
@@ -205,12 +205,24 @@ func handleBind(w ldap.ResponseWriter, m *ldap.Message) {
 	w.Write(res)
 }
 
-func ExtractMail(filter string) string {
-	var mailRe = regexp.MustCompile(`mail=([^*^)]+)`)
-	if m := mailRe.FindStringSubmatch(filter); len(m) > 1 {
-		return m[1]
+func ExtractFilter(filter string) (string, string, error) {
+	attributes := [3]string{"objectGUID", "cn", "mail"}
+	for _, attr_name := range attributes {
+		attr_value, err := ExtractFilterValue(attr_name, filter)
+		if err != nil {
+			continue
+		}
+		return attr_name, attr_value, nil
 	}
-	return ""
+	return "", "", errors.New("Could not identify an attribute for filtering")
+}
+
+func ExtractFilterValue(attribute string, filter string) (string, error) {
+	var mailRe = regexp.MustCompile(attribute + "=([^)]+)")
+	if m := mailRe.FindStringSubmatch(filter); len(m) > 1 {
+		return strings.Replace(m[1], "*", "", 2), nil
+	}
+	return "", errors.New("Attribute not round")
 }
 
 func handleSearch(w ldap.ResponseWriter, m *ldap.Message) {
