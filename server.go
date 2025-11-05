@@ -76,23 +76,30 @@ func deleteMailboxMapEntry(uuid string) bool {
 	return false
 }
 
-func main() {
-	flag.Parse()
-	ldap.Logger = log.New(os.Stdout, "[server] ", log.LstdFlags)
-	server := ldap.NewServer()
+func initializeObjectGuidCache() {
 	getDbMailboxes("") // Initialize UUID Map
 	log.Printf("Length of objectGUID map: %d", len(mailboxMap))
+}
 
+func initializeServer() ldap.Server {
+	server := ldap.NewServer()
 	routes := ldap.NewRouteMux()
 	routes.Bind(handleBind).Label("Bind Request")
 	routes.Search(handleSearch).Label("Search Query")
 	server.Handle(routes)
+	return *server
+}
+
+func main() {
+	flag.Parse()
+	ldap.Logger = log.New(os.Stdout, "[server] ", log.LstdFlags)
+	initializeObjectGuidCache()
+	server := initializeServer()
 	go server.ListenAndServe(string(*listenAddr))
 	ch := make(chan os.Signal)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
 	<-ch
 	close(ch)
-
 	server.Stop()
 }
 
