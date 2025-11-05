@@ -84,8 +84,8 @@ func main() {
 	log.Printf("Length of objectGUID map: %d", len(mailboxMap))
 
 	routes := ldap.NewRouteMux()
-	routes.Bind(handleBind)
-	routes.Search(handleSearch).Label("Search - Generic")
+	routes.Bind(handleBind).Label("Bind Request")
+	routes.Search(handleSearch).Label("Search Query")
 	server.Handle(routes)
 	go server.ListenAndServe(string(*listenAddr))
 	ch := make(chan os.Signal)
@@ -203,6 +203,21 @@ func comparePasswordHash(username string, password string) bool {
 	return validated
 }
 
+func DnToMailbox(dn string) (string, bool) {
+	var localpart string
+	dn_parts := strings.Split(dn, ",")
+	if dn_parts[len(dn_parts)-1] != "dc=net" && dn_parts[len(dn_parts)-2] != "dc=verdigado" {
+		return "", false
+	}
+	dn_parts = dn_parts[:len(dn_parts)-2]
+	localpart, dn_parts = dn_parts[0], dn_parts[1:]
+	localpart = strings.ReplaceAll(localpart, "cn=", "")
+	for i := 0; i < len(dn_parts); i++ {
+		dn_parts[i] = strings.ReplaceAll(dn_parts[i], "dc=", "")
+	}
+	return localpart + "@" + strings.Join(dn_parts, "."), true
+}
+
 func handleBind(w ldap.ResponseWriter, m *ldap.Message) {
 	r := m.GetBindRequest()
 	res := ldap.NewBindResponse(ldap.LDAPResultSuccess)
@@ -211,16 +226,21 @@ func handleBind(w ldap.ResponseWriter, m *ldap.Message) {
 			w.Write(res)
 			return
 		}
-		var user_password string = fmt.Sprintf("%s", r.Authentication())
-		if *debugMode == "true" {
-			log.Printf("Binding User=%s", string(r.Name()))
-		}
-		if !comparePasswordHash(string(r.Name()), user_password) {
-			res.SetResultCode(ldap.LDAPResultInvalidCredentials)
-			res.SetDiagnosticMessage("invalid credentials")
+		mailbox, valid_dn := DnToMailbox(string(r.Name()))
+		if !valid_dn {
+			log.Printf("Invalid DN: %s", string(r.Name()))
 		} else {
+			var user_password string = fmt.Sprintf("%s", r.Authentication())
 			if *debugMode == "true" {
-				log.Printf("Login succeeded.")
+				log.Printf("Binding User: %s", mailbox)
+			}
+			if !comparePasswordHash(mailbox, user_password) {
+				res.SetResultCode(ldap.LDAPResultInvalidCredentials)
+				res.SetDiagnosticMessage("invalid credentials")
+			} else {
+				if *debugMode == "true" {
+					log.Printf("Login succeeded.")
+				}
 			}
 		}
 	} else {
