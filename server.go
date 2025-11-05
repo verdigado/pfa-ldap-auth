@@ -47,13 +47,19 @@ type MailboxList struct {
 
 var mailboxMap []MailboxList
 
+var ldap_attributes_map = map[string]string{
+	"objectGUID": "objectGUID",
+	"cn":         "username",
+	"mail":       "username",
+}
+
 func addMailboxMapEntry(uuid, mailbox string) {
 	mailboxMap = append(mailboxMap, MailboxList{UUID: uuid, Mailbox: mailbox})
 }
 
 func getMailboxMapEntry(uuid string) (string, bool) {
 	for _, e := range mailboxMap {
-		if e.UUID == uuid {
+		if strings.HasPrefix(e.UUID, uuid) {
 			return e.Mailbox, true
 		}
 	}
@@ -74,6 +80,8 @@ func main() {
 	flag.Parse()
 	ldap.Logger = log.New(os.Stdout, "[server] ", log.LstdFlags)
 	server := ldap.NewServer()
+	getDbMailboxes("") // Initialize UUID Map
+	log.Printf("Length of objectGUID map: %d", len(mailboxMap))
 
 	routes := ldap.NewRouteMux()
 	routes.Bind(handleBind)
@@ -106,15 +114,32 @@ func getPasswordHash(username string) string {
 	return password_hash
 }
 
-func getAllDbMailboxes(filter string) ([]Mailbox, error) {
+func getDbMailboxes(filter string) ([]Mailbox, error) {
 	var db = getDatabase()
+	var result []Mailbox
 	filter_key, filter_value, filter_err := ExtractFilter(filter)
+	var exact_match bool = false
+
+	if filter_key == "objectGUID" {
+		new_filter_value, exists := getMailboxMapEntry(filter_value)
+		if !exists {
+			log.Printf("Could not map objectGUID %s to username.", filter_value)
+			return result, errors.New("could not find objectGUID")
+		}
+		filter_value = new_filter_value
+		filter_key = "username"
+		exact_match = true
+	}
+
 	query := "SELECT username, domain, local_part, name FROM mailbox"
-	if filter_err == nil {
+	if filter_err == nil && filter != "" && !exact_match {
 		query += " WHERE " + filter_key + " LIKE '%" + filter_value + "%'"
+	} else if filter_err == nil && filter != "" && exact_match {
+		query += " WHERE " + filter_key + " = '" + filter_value + "'"
 	}
 	if *debugMode == "true" {
-		query += " LIMIT 10"
+		//query += " LIMIT 10"
+		log.Printf("Query: %s", query)
 	}
 	rows, err := db.Query(query)
 	if err != nil {
@@ -123,7 +148,6 @@ func getAllDbMailboxes(filter string) ([]Mailbox, error) {
 	}
 	defer rows.Close()
 
-	var result []Mailbox
 	for rows.Next() {
 		var m Mailbox
 		if err := rows.Scan(&m.Username, &m.Domain, &m.Localpart, &m.Name); err != nil {
@@ -137,6 +161,7 @@ func getAllDbMailboxes(filter string) ([]Mailbox, error) {
 		}
 		if m.Localpart != "*" && m.Localpart != "" && m.Localpart != " " {
 			m.objectGUID = UUIDv4FromString(m.Username)
+			addMailboxMapEntry(m.objectGUID, m.Username)
 		} else {
 			log.Printf("Failed to UUID (%s): %s", m.Username, err)
 			continue
@@ -206,15 +231,14 @@ func handleBind(w ldap.ResponseWriter, m *ldap.Message) {
 }
 
 func ExtractFilter(filter string) (string, string, error) {
-	attributes := [3]string{"objectGUID", "cn", "mail"}
-	for _, attr_name := range attributes {
+	for attr_name, sql_name := range ldap_attributes_map {
 		attr_value, err := ExtractFilterValue(attr_name, filter)
 		if err != nil {
 			continue
 		}
-		return attr_name, attr_value, nil
+		return sql_name, attr_value, nil
 	}
-	return "", "", errors.New("Could not identify an attribute for filtering")
+	return "", "", errors.New("could not identify an attribute for filtering")
 }
 
 func ExtractFilterValue(attribute string, filter string) (string, error) {
@@ -222,7 +246,7 @@ func ExtractFilterValue(attribute string, filter string) (string, error) {
 	if m := mailRe.FindStringSubmatch(filter); len(m) > 1 {
 		return strings.Replace(m[1], "*", "", 2), nil
 	}
-	return "", errors.New("Attribute not round")
+	return "", errors.New("attribute not round")
 }
 
 func handleSearch(w ldap.ResponseWriter, m *ldap.Message) {
@@ -235,9 +259,9 @@ func handleSearch(w ldap.ResponseWriter, m *ldap.Message) {
 		//log.Printf("Request Attributes=%s", r.Attributes())
 		//log.Printf("Request TimeLimit=%d", r.TimeLimit().Int())
 	}
-	addresses, err := getAllDbMailboxes(r.FilterString())
+	addresses, err := getDbMailboxes(r.FilterString())
 	if err != nil {
-		log.Print("failed to get mail addresses")
+		log.Printf("failed to get mail addresses. Filter: '%s'", r.FilterString())
 	} else {
 		log.Printf("Received %d results", len(addresses))
 	}
@@ -251,7 +275,6 @@ func handleSearch(w ldap.ResponseWriter, m *ldap.Message) {
 	}
 	res := ldap.NewSearchResultDoneResponse(ldap.LDAPResultSuccess)
 	w.Write(res)
-
 }
 
 func MailboxToDN(mailbox string) (string, error) {
