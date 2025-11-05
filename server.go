@@ -114,9 +114,7 @@ func getPasswordHash(username string) string {
 	return password_hash
 }
 
-func getDbMailboxes(filter string) ([]Mailbox, error) {
-	var db = getDatabase()
-	var result []Mailbox
+func GenerateSqlQuery(filter string) (string, error) {
 	filter_key, filter_value, filter_err := ExtractFilter(filter)
 	var exact_match bool = false
 
@@ -124,7 +122,7 @@ func getDbMailboxes(filter string) ([]Mailbox, error) {
 		new_filter_value, exists := getMailboxMapEntry(filter_value)
 		if !exists {
 			log.Printf("Could not map objectGUID %s to username.", filter_value)
-			return result, errors.New("could not find objectGUID")
+			return "", errors.New("could not find objectGUID")
 		}
 		filter_value = new_filter_value
 		filter_key = "username"
@@ -140,6 +138,16 @@ func getDbMailboxes(filter string) ([]Mailbox, error) {
 	if *debugMode == "true" {
 		//query += " LIMIT 10"
 		log.Printf("Query: %s", query)
+	}
+	return query, nil
+}
+
+func getDbMailboxes(filter string) ([]Mailbox, error) {
+	var db = getDatabase()
+	var result []Mailbox
+	query, err := GenerateSqlQuery(filter)
+	if err != nil {
+		return result, err
 	}
 	rows, err := db.Query(query)
 	if err != nil {
@@ -273,11 +281,7 @@ func handleSearch(w ldap.ResponseWriter, m *ldap.Message) {
 	r := m.GetSearchRequest()
 
 	if *debugMode == "true" {
-		//log.Printf("Request BaseDn=%s", r.BaseObject())
-		//log.Printf("Request Filter=%s", r.Filter())
 		log.Printf("Request FilterString=%s", r.FilterString())
-		//log.Printf("Request Attributes=%s", r.Attributes())
-		//log.Printf("Request TimeLimit=%d", r.TimeLimit().Int())
 	}
 	addresses, err := getDbMailboxes(r.FilterString())
 	if err != nil {
