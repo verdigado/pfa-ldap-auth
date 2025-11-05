@@ -96,6 +96,11 @@ func main() {
 	server.Stop()
 }
 
+func validateUsername(username string) bool {
+	result, _ := regexp.MatchString("[a-zA-Z0-9-_.]*@[a-zA-Z0-9-.]", username)
+	return result
+}
+
 func getDatabase() sql.DB {
 	db, err := sql.Open(*dbDriver, *dbDSN)
 	if err != nil {
@@ -162,6 +167,10 @@ func getDbMailboxes(filter string) ([]Mailbox, error) {
 			log.Print("Failed to scan query result")
 			continue
 		}
+		if !validateUsername(m.Username) {
+			log.Printf("Invalid Username: %s", m.Username)
+			continue
+		}
 		m.Dn, err = MailboxToDN(m.Username)
 		if err != nil {
 			log.Printf("Failed to get Mailbox DN (%s): %s", m.Username, err)
@@ -223,20 +232,22 @@ func DnToMailbox(dn string) (string, bool) {
 	for i := 0; i < len(dn_parts); i++ {
 		dn_parts[i] = strings.ReplaceAll(dn_parts[i], "dc=", "")
 	}
-	return localpart + "@" + strings.Join(dn_parts, "."), true
+	username := localpart + "@" + strings.Join(dn_parts, ".")
+	if validateUsername(username) {
+		return username, true
+	}
+	return "", false
 }
 
 func handleBind(w ldap.ResponseWriter, m *ldap.Message) {
 	r := m.GetBindRequest()
 	res := ldap.NewBindResponse(ldap.LDAPResultSuccess)
+	username := string(r.Name())
+
 	if r.AuthenticationChoice() == "simple" {
-		if string(r.Name()) == "login" {
-			w.Write(res)
-			return
-		}
-		mailbox, valid_dn := DnToMailbox(string(r.Name()))
+		mailbox, valid_dn := DnToMailbox(username)
 		if !valid_dn {
-			log.Printf("Invalid DN: %s", string(r.Name()))
+			log.Printf("Invalid DN: %s", username)
 		} else {
 			var user_password string = fmt.Sprintf("%s", r.Authentication())
 			if *debugMode == "true" {
