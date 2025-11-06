@@ -1,0 +1,15 @@
+[Unit]
+Description=PostfixAdmin LDAP authentication bridge
+After=network.target
+
+[Service]
+Type=simple
+User=pfa-ldap
+Group=pfa-ldap
+ExecStart=/usr/local/bin/pfa-ldap-auth --db-dsn "keycloak:CHANGEME@tcp(localhost:3306)/postfixadmin" --base-dn "dc=example,dc=com"
+
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
