@@ -154,6 +154,30 @@ func GenerateSqlQuery(filter string) (string, error) {
 	return query, nil
 }
 
+func processMailboxRow(m Mailbox) (Mailbox, bool) {
+	var err error
+	if !validateUsername(m.Username) {
+		log.Printf("Invalid Username: %s", m.Username)
+		return m, false
+	}
+	m.Dn, err = MailboxToDN(m.Username)
+	if err != nil {
+		log.Printf("Failed to get Mailbox DN (%s): %s", m.Username, err)
+		return m, false
+	}
+	if m.Localpart != "*" && m.Localpart != "" && m.Localpart != " " {
+		m.objectGUID = UUIDv4FromString(m.Username)
+		addMailboxMapEntry(m.objectGUID, m.Username)
+	} else {
+		log.Printf("Failed to UUID (%s): %s", m.Username, err)
+		return m, false
+	}
+	if *debugMode == "true" {
+		log.Printf("%s %s %s", m.Username, m.objectGUID, m.Dn)
+	}
+	return m, true
+}
+
 func getDbMailboxes(filter string) ([]Mailbox, error) {
 	var db = getDatabase()
 	var result []Mailbox
@@ -171,29 +195,13 @@ func getDbMailboxes(filter string) ([]Mailbox, error) {
 	for rows.Next() {
 		var m Mailbox
 		if err := rows.Scan(&m.Username, &m.Domain, &m.Localpart, &m.Name); err != nil {
-			log.Print("Failed to scan query result")
+			log.Print("Failed to scan query row")
 			continue
 		}
-		if !validateUsername(m.Username) {
-			log.Printf("Invalid Username: %s", m.Username)
-			continue
+		processed_mailbox, success := processMailboxRow(m)
+		if success {
+			result = append(result, processed_mailbox)
 		}
-		m.Dn, err = MailboxToDN(m.Username)
-		if err != nil {
-			log.Printf("Failed to get Mailbox DN (%s): %s", m.Username, err)
-			continue
-		}
-		if m.Localpart != "*" && m.Localpart != "" && m.Localpart != " " {
-			m.objectGUID = UUIDv4FromString(m.Username)
-			addMailboxMapEntry(m.objectGUID, m.Username)
-		} else {
-			log.Printf("Failed to UUID (%s): %s", m.Username, err)
-			continue
-		}
-		if *debugMode == "true" {
-			log.Printf("%s %s %s", m.Username, m.objectGUID, m.Dn)
-		}
-		result = append(result, m)
 	}
 	if err := rows.Err(); err != nil {
 		log.Print("Error in result")
