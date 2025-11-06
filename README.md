@@ -16,9 +16,8 @@ To provide the LDAP server, run the application:
 ```sh
 pfa-ldap-auth --db-dsn "keycloak:changeme@tcp(localhost:3306)/postfixadmin" --base-dn "dc=example,dc=com" [--debug true]
 ```
-The base-dn argument can be any arbitrary base DN.
 
-Use the `--help` argument to show all CLI options.
+The base-dn argument can be any arbitrary base DN. Use the `--help` argument to show all CLI options. To run this on a server, take a look at the [pfa-ldap.service](./pfa-ldap.service) file.
 
 ## License
 
