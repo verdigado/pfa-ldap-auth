@@ -321,6 +321,7 @@ func handleSearch(w ldap.ResponseWriter, m *ldap.Message) {
 		e.AddAttribute("cn", message.AttributeValue(mailbox.Username))
 		e.AddAttribute("displayName", message.AttributeValue(mailbox.Name))
 		e.AddAttribute("objectGUID", message.AttributeValue(mailbox.objectGUID))
+		e.AddAttribute("domain", message.AttributeValue(mailbox.Domain))
 		w.Write(e)
 	}
 	res := ldap.NewSearchResultDoneResponse(ldap.LDAPResultSuccess)
