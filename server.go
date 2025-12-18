@@ -22,6 +22,10 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+type LDAPServer struct {
+	db sql.DB
+}
+
 var (
 	listenAddr     = flag.String("listen", "127.0.0.1:1389", "LDAP listen address (host:port).")
 	dbDriver       = flag.String("db-driver", "mysql", "SQL driver name (mysql or postgres).")
@@ -76,16 +80,18 @@ func deleteMailboxMapEntry(uuid string) bool {
 	return false
 }
 
-func initializeObjectGuidCache() {
-	getDbMailboxes("") // Initialize UUID Map
+func initializeObjectGuidCache(db sql.DB) {
+	getDbMailboxes(db, "") // Initialize UUID Map
 	log.Printf("Length of objectGUID map: %d", len(mailboxMap))
 }
 
-func initializeServer() ldap.Server {
+func initializeServer(db sql.DB) ldap.Server {
+
+	srv := &LDAPServer{db: db}
 	server := ldap.NewServer()
 	routes := ldap.NewRouteMux()
-	routes.Bind(handleBind).Label("Bind Request")
-	routes.Search(handleSearch).Label("Search Query")
+	routes.Bind(srv.handleBind)
+	routes.Search(srv.handleSearch)
 	server.Handle(routes)
 	return *server
 }
@@ -93,8 +99,9 @@ func initializeServer() ldap.Server {
 func main() {
 	flag.Parse()
 	ldap.Logger = log.New(os.Stdout, "[server] ", log.LstdFlags)
-	initializeObjectGuidCache()
-	server := initializeServer()
+	db := getDatabase()
+	initializeObjectGuidCache(db)
+	server := initializeServer(db)
 	go server.ListenAndServe(string(*listenAddr))
 	ch := make(chan os.Signal)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
@@ -116,8 +123,7 @@ func getDatabase() sql.DB {
 	return *db
 }
 
-func getPasswordHash(username string) string {
-	var db = getDatabase()
+func getPasswordHash(db sql.DB, username string) string {
 	var password_hash string
 	err := db.QueryRow("SELECT password FROM mailbox WHERE username = ?", username).Scan(&password_hash)
 	if err != nil {
@@ -178,8 +184,7 @@ func processMailboxRow(m Mailbox) (Mailbox, bool) {
 	return m, true
 }
 
-func getDbMailboxes(filter string) ([]Mailbox, error) {
-	var db = getDatabase()
+func getDbMailboxes(db sql.DB, filter string) ([]Mailbox, error) {
 	var result []Mailbox
 	query, err := GenerateSqlQuery(filter)
 	if err != nil {
@@ -221,8 +226,8 @@ func compareBlfCrypt(password_hash string, password string) bool {
 	return err == nil
 }
 
-func comparePasswordHash(username string, password string) bool {
-	var password_hash string = getPasswordHash(username)
+func comparePasswordHash(db sql.DB, username string, password string) bool {
+	var password_hash string = getPasswordHash(db, username)
 	var validated = false
 	if strings.HasPrefix(password_hash, "{BLF-CRYPT}") {
 		validated = compareBlfCrypt(password_hash, password)
@@ -254,7 +259,7 @@ func DnToMailbox(dn string) (string, bool) {
 	return "", false
 }
 
-func handleBind(w ldap.ResponseWriter, m *ldap.Message) {
+func (s *LDAPServer) handleBind(w ldap.ResponseWriter, m *ldap.Message) {
 	r := m.GetBindRequest()
 	res := ldap.NewBindResponse(ldap.LDAPResultSuccess)
 	username := string(r.Name())
@@ -268,7 +273,7 @@ func handleBind(w ldap.ResponseWriter, m *ldap.Message) {
 			if *debugMode == "true" {
 				log.Printf("Binding User: %s", mailbox)
 			}
-			if !comparePasswordHash(mailbox, user_password) {
+			if !comparePasswordHash(s.db, mailbox, user_password) {
 				res.SetResultCode(ldap.LDAPResultInvalidCredentials)
 				res.SetDiagnosticMessage("invalid credentials")
 			} else {
@@ -303,13 +308,13 @@ func ExtractFilterValue(attribute string, filter string) (string, error) {
 	return "", errors.New("attribute not round")
 }
 
-func handleSearch(w ldap.ResponseWriter, m *ldap.Message) {
+func (s *LDAPServer) handleSearch(w ldap.ResponseWriter, m *ldap.Message) {
 	r := m.GetSearchRequest()
 
 	if *debugMode == "true" {
 		log.Printf("Request FilterString=%s", r.FilterString())
 	}
-	addresses, err := getDbMailboxes(r.FilterString())
+	addresses, err := getDbMailboxes(s.db, r.FilterString())
 	if err != nil {
 		log.Printf("failed to get mail addresses. Filter: '%s'", r.FilterString())
 	} else {
