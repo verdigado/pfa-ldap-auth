@@ -83,11 +83,6 @@ func deleteMailboxMapEntry(uuid string) bool {
 func initializeObjectGuidCache(db sql.DB) {
 	getDbMailboxes(db, "") // Initialize UUID Map
 	log.Printf("Length of objectGUID map: %d", len(mailboxMap))
-	if *debugMode == "true" {
-		for _, e := range mailboxMap {
-			log.Printf("UUID Map: %s -> %s", e.Mailbox, e.UUID)
-		}
-	}
 }
 
 func initializeServer(db sql.DB) ldap.Server {
