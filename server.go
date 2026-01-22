@@ -23,7 +23,7 @@ import (
 )
 
 type LDAPServer struct {
-	db sql.DB
+	db *sql.DB
 }
 
 var (
@@ -80,12 +80,12 @@ func deleteMailboxMapEntry(uuid string) bool {
 	return false
 }
 
-func initializeObjectGuidCache(db sql.DB) {
+func initializeObjectGuidCache(db *sql.DB) {
 	getDbMailboxes(db, "") // Initialize UUID Map
 	log.Printf("Length of objectGUID map: %d", len(mailboxMap))
 }
 
-func initializeServer(db sql.DB) ldap.Server {
+func initializeServer(db *sql.DB) ldap.Server {
 
 	srv := &LDAPServer{db: db}
 	server := ldap.NewServer()
@@ -100,6 +100,7 @@ func main() {
 	flag.Parse()
 	ldap.Logger = log.New(os.Stdout, "[server] ", log.LstdFlags)
 	db := getDatabase()
+	defer db.Close()
 	initializeObjectGuidCache(db)
 	server := initializeServer(db)
 	go server.ListenAndServe(string(*listenAddr))
@@ -115,15 +116,15 @@ func validateUsername(username string) bool {
 	return result
 }
 
-func getDatabase() sql.DB {
+func getDatabase() *sql.DB {
 	db, err := sql.Open(*dbDriver, *dbDSN)
 	if err != nil {
 		panic(err.Error())
 	}
-	return *db
+	return db
 }
 
-func getPasswordHash(db sql.DB, username string) string {
+func getPasswordHash(db *sql.DB, username string) string {
 	var password_hash string
 	err := db.QueryRow("SELECT password FROM mailbox WHERE username = ?", username).Scan(&password_hash)
 	if err != nil {
@@ -184,7 +185,7 @@ func processMailboxRow(m Mailbox) (Mailbox, bool) {
 	return m, true
 }
 
-func getDbMailboxes(db sql.DB, filter string) ([]Mailbox, error) {
+func getDbMailboxes(db *sql.DB, filter string) ([]Mailbox, error) {
 	var result []Mailbox
 	query, err := GenerateSqlQuery(filter)
 	if err != nil {
@@ -226,7 +227,7 @@ func compareBlfCrypt(password_hash string, password string) bool {
 	return err == nil
 }
 
-func comparePasswordHash(db sql.DB, username string, password string) bool {
+func comparePasswordHash(db *sql.DB, username string, password string) bool {
 	var password_hash string = getPasswordHash(db, username)
 	var validated = false
 	if strings.HasPrefix(password_hash, "{BLF-CRYPT}") {
