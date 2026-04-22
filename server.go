@@ -11,15 +11,18 @@ import (
 	"net/mail"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"syscall"
 	"unicode/utf8"
 
+	ldapclient "github.com/go-ldap/ldap/v3"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/lor00x/goldap/message"
 	ldap "github.com/vjeantet/ldapserver"
 	"golang.org/x/crypto/bcrypt"
+	"gopkg.in/yaml.v3"
 )
 
 type LDAPServer struct {
@@ -33,7 +36,137 @@ var (
 	passwordFormat = flag.String("password-format", "", "Force a password format (cleartext|md5|sha1|bcrypt). If empty, server tries to read password_format column (if available).")
 	baseDn         = flag.String("base-dn", "dc=domain,dc=example", "Base DN")
 	debugMode      = flag.String("debug", "false", "Debug mode")
+	configDir      = flag.String("config-dir", "/etc/pfa-ldap.d", "Directory containing per-domain LDAP backend config files (*.yaml / *.yml).")
 )
+
+// LDAPBackendConfig holds the configuration for one upstream LDAP backend,
+// loaded from a YAML file in the config directory.
+//
+// TLS mode is selected via the ldap-url scheme:
+//   - ldap://  — plaintext (optionally upgraded via starttls: true)
+//   - ldaps:// — implicit TLS (port 636)
+//   - ldapi:// — Unix socket
+type LDAPBackendConfig struct {
+	MailDomain   string `yaml:"mail-domain"`
+	LDAPUrl      string `yaml:"ldap-url"`
+	StartTLS     bool   `yaml:"starttls"`
+	BaseDN       string `yaml:"base-dn"`
+	BindDN       string `yaml:"bind-dn"`
+	BindPassword string `yaml:"bind-password"`
+	SearchFilter string `yaml:"search-filter"`
+}
+
+// ldapBackends maps lower-cased mail domain → LDAPBackendConfig.
+// Populated at startup from --config-dir; never written after that.
+var ldapBackends map[string]LDAPBackendConfig
+
+// loadBackendConfigs reads all *.yaml / *.yml files from dir and populates
+// ldapBackends. Missing directory is treated as a warning, not a fatal error.
+func loadBackendConfigs(dir string) {
+	ldapBackends = make(map[string]LDAPBackendConfig)
+
+	patterns := []string{filepath.Join(dir, "*.yaml"), filepath.Join(dir, "*.yml")}
+	var files []string
+	for _, p := range patterns {
+		matches, err := filepath.Glob(p)
+		if err != nil {
+			log.Printf("Warning: error globbing %s: %v", p, err)
+			continue
+		}
+		files = append(files, matches...)
+	}
+
+	if len(files) == 0 {
+		log.Printf("No backend config files found in %s", dir)
+		return
+	}
+
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			log.Printf("Warning: could not read backend config %s: %v", f, err)
+			continue
+		}
+		var cfg LDAPBackendConfig
+		if err := yaml.Unmarshal(data, &cfg); err != nil {
+			log.Printf("Warning: could not parse backend config %s: %v", f, err)
+			continue
+		}
+		if cfg.MailDomain == "" {
+			log.Printf("Warning: backend config %s has no mail-domain, skipping", f)
+			continue
+		}
+		domain := strings.ToLower(cfg.MailDomain)
+		if _, exists := ldapBackends[domain]; exists {
+			log.Printf("Warning: duplicate mail-domain %q in file %s (already loaded)", domain, f)
+			continue
+		}
+		ldapBackends[domain] = cfg
+		log.Printf("Loaded LDAP backend for domain %q from %s", domain, f)
+	}
+}
+
+// authenticateViaLDAP authenticates email/password against an upstream LDAP
+// server described by cfg. It follows the search-then-bind pattern:
+//  1. Dial the upstream server (with TLS / STARTTLS as configured).
+//  2. Bind with the service account (bind-dn / bind-password).
+//  3. Search for the user using search-filter (%m replaced by full email).
+//  4. Bind with the found DN and the client-provided password.
+func authenticateViaLDAP(cfg LDAPBackendConfig, email, password string) (bool, error) {
+	if password == "" {
+		return false, nil
+	}
+	conn, err := ldapclient.DialURL(cfg.LDAPUrl)
+	if err != nil {
+		return false, fmt.Errorf("dial %s: %w", cfg.LDAPUrl, err)
+	}
+	defer conn.Close()
+
+	if cfg.StartTLS {
+		if err := conn.StartTLS(nil); err != nil {
+			return false, fmt.Errorf("starttls %s: %w", cfg.LDAPUrl, err)
+		}
+	}
+
+	if err := conn.Bind(cfg.BindDN, cfg.BindPassword); err != nil {
+		return false, fmt.Errorf("service bind as %s: %w", cfg.BindDN, err)
+	}
+
+	filter := strings.ReplaceAll(cfg.SearchFilter, "%m", ldapclient.EscapeFilter(email))
+	searchReq := ldapclient.NewSearchRequest(
+		cfg.BaseDN,
+		ldapclient.ScopeWholeSubtree,
+		ldapclient.NeverDerefAliases,
+		2,
+		0,
+		false,
+		filter,
+		[]string{"dn"},
+		nil,
+	)
+	sr, err := conn.Search(searchReq)
+	if err != nil {
+		return false, fmt.Errorf("search for %s: %w", email, err)
+	}
+	if len(sr.Entries) == 0 {
+		if *debugMode == "true" {
+			log.Printf("LDAP backend: no entry found for %s with filter %s", email, filter)
+		}
+		return false, nil
+	}
+	if len(sr.Entries) > 1 {
+		return false, fmt.Errorf("ambiguous search: %d entries found for %s", len(sr.Entries), email)
+	}
+	userDN := sr.Entries[0].DN
+
+	if err := conn.Bind(userDN, password); err != nil {
+		if *debugMode == "true" {
+			log.Printf("LDAP backend: bind failed for DN %s: %v", userDN, err)
+		}
+		return false, nil
+	}
+	return true, nil
+}
 
 type Mailbox struct {
 	Dn         string
@@ -98,7 +231,12 @@ func initializeServer(db *sql.DB) ldap.Server {
 
 func main() {
 	flag.Parse()
-	ldap.Logger = log.New(os.Stdout, "[server] ", log.LstdFlags)
+	if *debugMode == "true" {
+		ldap.Logger = log.New(os.Stdout, "[server] ", log.LstdFlags)
+	} else {
+		ldap.Logger = ldap.DiscardingLogger
+	}
+	loadBackendConfigs(*configDir)
 	db := getDatabase()
 	defer db.Close()
 	initializeObjectGuidCache(db)
@@ -124,16 +262,16 @@ func getDatabase() *sql.DB {
 	return db
 }
 
-func getPasswordHash(db *sql.DB, username string) string {
+func getPasswordHash(db *sql.DB, username string) (string, error) {
 	var password_hash string
 	err := db.QueryRow("SELECT password FROM mailbox WHERE username = ?", username).Scan(&password_hash)
 	if err != nil {
-		log.Fatal(err)
+		return "", err
 	}
-	return password_hash
+	return password_hash, nil
 }
 
-func GenerateSqlQuery(filter string) (string, error) {
+func GenerateSqlQuery(filter string) (string, []any, error) {
 	filter_key, filter_value, filter_err := ExtractFilter(filter)
 	var exact_match bool = false
 
@@ -141,24 +279,28 @@ func GenerateSqlQuery(filter string) (string, error) {
 		new_filter_value, exists := getMailboxMapEntry(filter_value)
 		if !exists {
 			log.Printf("Could not map objectGUID %s to username.", filter_value)
-			return "", errors.New("could not find objectGUID")
+			return "", nil, errors.New("could not find objectGUID")
 		}
 		filter_value = new_filter_value
 		filter_key = "username"
 		exact_match = true
 	}
 
-	query := "SELECT username, domain, local_part, name FROM mailbox"
+	var query string
+	var args []any
 	if filter_err == nil && filter != "" && !exact_match {
-		query += " WHERE " + filter_key + " LIKE '%" + filter_value + "%'"
+		query = "SELECT username, domain, local_part, name FROM mailbox WHERE " + filter_key + " LIKE ?"
+		args = []any{"%" + filter_value + "%"}
 	} else if filter_err == nil && filter != "" && exact_match {
-		query += " WHERE " + filter_key + " = '" + filter_value + "'"
+		query = "SELECT username, domain, local_part, name FROM mailbox WHERE " + filter_key + " = ?"
+		args = []any{filter_value}
+	} else {
+		query = "SELECT username, domain, local_part, name FROM mailbox"
 	}
 	if *debugMode == "true" {
-		//query += " LIMIT 10"
 		log.Printf("Query: %s", query)
 	}
-	return query, nil
+	return query, args, nil
 }
 
 func processMailboxRow(m Mailbox) (Mailbox, bool) {
@@ -187,11 +329,11 @@ func processMailboxRow(m Mailbox) (Mailbox, bool) {
 
 func getDbMailboxes(db *sql.DB, filter string) ([]Mailbox, error) {
 	var result []Mailbox
-	query, err := GenerateSqlQuery(filter)
+	query, args, err := GenerateSqlQuery(filter)
 	if err != nil {
 		return result, err
 	}
-	rows, err := db.Query(query)
+	rows, err := db.Query(query, args...)
 	if err != nil {
 		log.Print("Failed to execute query")
 		return nil, err
@@ -228,7 +370,13 @@ func compareBlfCrypt(password_hash string, password string) bool {
 }
 
 func comparePasswordHash(db *sql.DB, username string, password string) bool {
-	var password_hash string = getPasswordHash(db, username)
+	password_hash, err := getPasswordHash(db, username)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			log.Printf("Error fetching password hash for %s: %v", username, err)
+		}
+		return false
+	}
 	var validated = false
 	if strings.HasPrefix(password_hash, "{BLF-CRYPT}") {
 		validated = compareBlfCrypt(password_hash, password)
@@ -242,16 +390,23 @@ func comparePasswordHash(db *sql.DB, username string, password string) bool {
 }
 
 func DnToMailbox(dn string) (string, bool) {
-	var localpart string
 	dn_parts := strings.Split(dn, ",")
-	if dn_parts[len(dn_parts)-1] != "dc=net" && dn_parts[len(dn_parts)-2] != "dc=verdigado" {
+	base_parts := strings.Split(*baseDn, ",")
+	// Strip the base DN suffix from the end of the DN parts.
+	if len(dn_parts) <= len(base_parts) {
 		return "", false
 	}
-	dn_parts = dn_parts[:len(dn_parts)-2]
-	localpart, dn_parts = dn_parts[0], dn_parts[1:]
-	localpart = strings.ReplaceAll(localpart, "cn=", "")
+	tail := dn_parts[len(dn_parts)-len(base_parts):]
+	for i, p := range tail {
+		if !strings.EqualFold(p, base_parts[i]) {
+			return "", false
+		}
+	}
+	dn_parts = dn_parts[:len(dn_parts)-len(base_parts)]
+	localpart, dn_parts := dn_parts[0], dn_parts[1:]
+	localpart = strings.TrimPrefix(localpart, "cn=")
 	for i := 0; i < len(dn_parts); i++ {
-		dn_parts[i] = strings.ReplaceAll(dn_parts[i], "dc=", "")
+		dn_parts[i] = strings.TrimPrefix(dn_parts[i], "dc=")
 	}
 	username := localpart + "@" + strings.Join(dn_parts, ".")
 	if validateUsername(username) {
@@ -270,17 +425,49 @@ func (s *LDAPServer) handleBind(w ldap.ResponseWriter, m *ldap.Message) {
 		if !valid_dn {
 			log.Printf("Invalid DN: %s", username)
 		} else {
-			var user_password string = fmt.Sprintf("%s", r.Authentication())
+			user_password := fmt.Sprintf("%s", r.Authentication())
 			if *debugMode == "true" {
 				log.Printf("Binding User: %s", mailbox)
 			}
-			if !comparePasswordHash(s.db, mailbox, user_password) {
+
+			// Extract the mail domain to check for a dedicated LDAP backend.
+			var authenticated bool
+			var usedLDAPBackend bool
+			var authDomain string
+			atIdx := strings.LastIndex(mailbox, "@")
+			if atIdx >= 0 {
+				authDomain = strings.ToLower(mailbox[atIdx+1:])
+				if backend, ok := ldapBackends[authDomain]; ok {
+					usedLDAPBackend = true
+					if *debugMode == "true" {
+						log.Printf("Using LDAP backend for domain %q", authDomain)
+					}
+					ok, err := authenticateViaLDAP(backend, mailbox, user_password)
+					if err != nil {
+						log.Printf("LDAP backend error for %s: %v", mailbox, err)
+					}
+					authenticated = ok
+				}
+			}
+
+			// Fall back to SQL-based authentication when no LDAP backend matched.
+			if !usedLDAPBackend {
+				authenticated = comparePasswordHash(s.db, mailbox, user_password)
+			}
+
+			// Log authentication result.
+			var backend string
+			if usedLDAPBackend {
+				backend = "LDAP (" + authDomain + ")"
+			} else {
+				backend = "SQL"
+			}
+			if authenticated {
+				log.Printf("Authentication successful: email=%s backend=%s", mailbox, backend)
+			} else {
+				log.Printf("Authentication failed: email=%s backend=%s", mailbox, backend)
 				res.SetResultCode(ldap.LDAPResultInvalidCredentials)
 				res.SetDiagnosticMessage("invalid credentials")
-			} else {
-				if *debugMode == "true" {
-					log.Printf("Login succeeded.")
-				}
 			}
 		}
 	} else {
