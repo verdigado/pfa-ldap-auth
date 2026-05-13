@@ -58,6 +58,11 @@ type LDAPBackendConfig struct {
 	BindDN       string `yaml:"bind-dn"`
 	BindPassword string `yaml:"bind-password"`
 	SearchFilter string `yaml:"search-filter"`
+	// DisableSQLFallback, when true, prevents the daemon from falling back to
+	// SQL authentication for this domain if the LDAP bind fails or the user
+	// is not present in the upstream directory. Defaults to false, which
+	// preserves the historic behaviour of trying SQL after LDAP.
+	DisableSQLFallback bool `yaml:"disable-sql-fallback"`
 }
 
 // ldapBackends maps lower-cased mail domain → LDAPBackendConfig.
@@ -491,13 +496,15 @@ func (s *LDAPServer) handleBind(w ldap.ResponseWriter, m *ldap.Message) {
 
 			// Extract the mail domain to check for a dedicated LDAP backend.
 			var authenticated bool
-			var usedLDAPBackend bool
+			var triedLDAPBackend bool
+			var sqlFallbackDisabled bool
 			var authDomain string
 			atIdx := strings.LastIndex(mailbox, "@")
 			if atIdx >= 0 {
 				authDomain = strings.ToLower(mailbox[atIdx+1:])
 				if backend, ok := ldapBackends[authDomain]; ok {
-					usedLDAPBackend = true
+					triedLDAPBackend = true
+					sqlFallbackDisabled = backend.DisableSQLFallback
 					if *debugMode == "true" {
 						log.Printf("Using LDAP backend for domain %q", authDomain)
 					}
@@ -509,18 +516,31 @@ func (s *LDAPServer) handleBind(w ldap.ResponseWriter, m *ldap.Message) {
 				}
 			}
 
-			// Fall back to SQL-based authentication when no LDAP backend matched.
-			if !usedLDAPBackend {
+			// Determine which backend produced the result. SQL is used either
+			// when no LDAP backend is configured for the domain, or as a
+			// fallback when the LDAP backend rejected the credentials / failed
+			// — unless the backend has disable-sql-fallback: true.
+			var backend string
+			switch {
+			case authenticated:
+				backend = "LDAP (" + authDomain + ")"
+			case triedLDAPBackend && sqlFallbackDisabled:
+				if *debugMode == "true" {
+					log.Printf("LDAP backend rejected %s, SQL fallback disabled for domain %q", mailbox, authDomain)
+				}
+				backend = "LDAP (" + authDomain + ")"
+			default:
+				if triedLDAPBackend && *debugMode == "true" {
+					log.Printf("LDAP backend rejected %s, falling back to SQL", mailbox)
+				}
 				authenticated = comparePasswordHash(s.db, mailbox, user_password)
+				if triedLDAPBackend {
+					backend = "SQL (fallback from LDAP " + authDomain + ")"
+				} else {
+					backend = "SQL"
+				}
 			}
 
-			// Log authentication result.
-			var backend string
-			if usedLDAPBackend {
-				backend = "LDAP (" + authDomain + ")"
-			} else {
-				backend = "SQL"
-			}
 			if authenticated {
 				log.Printf("Authentication successful: email=%s backend=%s", mailbox, backend)
 			} else {

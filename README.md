@@ -23,7 +23,7 @@ The base-dn argument can be any arbitrary base DN. Use the `--help` argument to 
 
 ### Domain Based LDAP Authentication
 
-Additionally, it is possible to configure LDAP authentication back ends for mail domains. The user will be searched with the mail attribute and the found DN + mail password used for a BIND. If the bind succeeds, the user is logged in. To configure LDAP for a domain, create a config file `/etc/pfa-ldap.d/example.com.yaml`:
+Additionally, it is possible to configure LDAP authentication back ends for mail domains. The user will be searched with the mail attribute and the found DN + mail password used for a BIND. If the bind succeeds, the user is logged in. If the LDAP bind fails (wrong credentials, user not found, or upstream error), the daemon transparently falls back to SQL authentication, so locally-managed mailboxes continue to work alongside LDAP-backed ones for the same domain. To require LDAP for a domain and skip the SQL retry, set `disable-sql-fallback: true` in the domain's config file. To configure LDAP for a domain, create a config file `/etc/pfa-ldap.d/example.com.yaml`:
 
 ```yaml
 mail-domain: example.com
@@ -33,6 +33,9 @@ base-dn: ou=people,dc=example,dc=com
 bind-dn: cn=service,dc=example,dc=com
 bind-password: secret
 search-filter: "(mail=%m)"
+# Optional. When true, a failed LDAP bind is treated as a final failure
+# instead of falling back to SQL authentication for this domain.
+disable-sql-fallback: false
 ```
 
 #### Connecting via a private IP while preserving TLS verification
