@@ -2,13 +2,16 @@ package main
 
 import (
 	"crypto/sha256"
+	"crypto/tls"
 	"database/sql"
 	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/mail"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -49,6 +52,7 @@ var (
 type LDAPBackendConfig struct {
 	MailDomain   string `yaml:"mail-domain"`
 	LDAPUrl      string `yaml:"ldap-url"`
+	ServerIP     string `yaml:"server-ip"`
 	StartTLS     bool   `yaml:"starttls"`
 	BaseDN       string `yaml:"base-dn"`
 	BindDN       string `yaml:"bind-dn"`
@@ -96,6 +100,12 @@ func loadBackendConfigs(dir string) {
 			log.Printf("Warning: backend config %s has no mail-domain, skipping", f)
 			continue
 		}
+		if cfg.ServerIP != "" {
+			if net.ParseIP(cfg.ServerIP) == nil {
+				log.Printf("Warning: backend config %s has invalid server-ip %q, ignoring", f, cfg.ServerIP)
+				cfg.ServerIP = ""
+			}
+		}
 		domain := strings.ToLower(cfg.MailDomain)
 		if _, exists := ldapBackends[domain]; exists {
 			log.Printf("Warning: duplicate mail-domain %q in file %s (already loaded)", domain, f)
@@ -104,6 +114,51 @@ func loadBackendConfigs(dir string) {
 		ldapBackends[domain] = cfg
 		log.Printf("Loaded LDAP backend for domain %q from %s", domain, f)
 	}
+}
+
+// dialBackend dials the upstream LDAP server described by cfg. When
+// cfg.ServerIP is set, the TCP connection target is rewritten to that IP, but
+// the TLS ServerName remains the hostname from cfg.LDAPUrl so the certificate
+// is verified against the FQDN using the operating system's trust store. The
+// returned *tls.Config is reused by STARTTLS so the same ServerName applies on
+// upgrade.
+func dialBackend(cfg LDAPBackendConfig) (*ldapclient.Conn, *tls.Config, error) {
+	u, err := url.Parse(cfg.LDAPUrl)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse ldap-url %q: %w", cfg.LDAPUrl, err)
+	}
+	scheme := strings.ToLower(u.Scheme)
+	host := u.Hostname()
+	port := u.Port()
+	if port == "" {
+		switch scheme {
+		case "ldap":
+			port = "389"
+		case "ldaps":
+			port = "636"
+		}
+	}
+
+	tlsCfg := &tls.Config{ServerName: host}
+
+	dialURL := cfg.LDAPUrl
+	if cfg.ServerIP != "" {
+		if scheme == "ldapi" {
+			return nil, nil, fmt.Errorf("server-ip is not valid with ldapi:// scheme")
+		}
+		hostPart := cfg.ServerIP
+		if strings.Contains(hostPart, ":") {
+			// IPv6 literal needs brackets inside a URL authority.
+			hostPart = "[" + hostPart + "]"
+		}
+		dialURL = fmt.Sprintf("%s://%s:%s", scheme, hostPart, port)
+	}
+
+	conn, err := ldapclient.DialURL(dialURL, ldapclient.DialWithTLSConfig(tlsCfg))
+	if err != nil {
+		return nil, nil, fmt.Errorf("dial %s: %w", dialURL, err)
+	}
+	return conn, tlsCfg, nil
 }
 
 // authenticateViaLDAP authenticates email/password against an upstream LDAP
@@ -116,14 +171,18 @@ func authenticateViaLDAP(cfg LDAPBackendConfig, email, password string) (bool, e
 	if password == "" {
 		return false, nil
 	}
-	conn, err := ldapclient.DialURL(cfg.LDAPUrl)
+	conn, tlsCfg, err := dialBackend(cfg)
 	if err != nil {
-		return false, fmt.Errorf("dial %s: %w", cfg.LDAPUrl, err)
+		return false, err
 	}
 	defer conn.Close()
 
+	if *debugMode == "true" && cfg.ServerIP != "" {
+		log.Printf("LDAP backend: dialing %s (TLS ServerName=%s)", cfg.ServerIP, tlsCfg.ServerName)
+	}
+
 	if cfg.StartTLS {
-		if err := conn.StartTLS(nil); err != nil {
+		if err := conn.StartTLS(tlsCfg); err != nil {
 			return false, fmt.Errorf("starttls %s: %w", cfg.LDAPUrl, err)
 		}
 	}

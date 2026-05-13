@@ -35,6 +35,23 @@ bind-password: secret
 search-filter: "(mail=%m)"
 ```
 
+#### Connecting via a private IP while preserving TLS verification
+
+When the LDAP server must be reached on an internal/private address that is not the same as the public DNS record, set `server-ip` to the IP that should be used for the TCP connection. The hostname from `ldap-url` is still used as the TLS `ServerName`, so the certificate is verified against that FQDN using the operating system's trust store.
+
+```yaml
+mail-domain: example.com
+ldap-url: ldaps://ldap.example.com:636
+server-ip: 10.0.0.42
+starttls: false
+base-dn: ou=people,dc=example,dc=com
+bind-dn: cn=service,dc=example,dc=com
+bind-password: secret
+search-filter: "(mail=%m)"
+```
+
+In this example the daemon connects to `10.0.0.42:636` but expects a certificate valid for `ldap.example.com`. `server-ip` must be an IP literal (IPv4 or IPv6) and is not valid with the `ldapi://` scheme.
+
 ## License
 
 All files in this project are licensed with [Apache 2.0](./LICENSE).
