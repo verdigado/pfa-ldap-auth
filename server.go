@@ -17,7 +17,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 	"unicode/utf8"
 
 	ldapclient "github.com/go-ldap/ldap/v3"
@@ -305,6 +307,7 @@ func main() {
 	defer db.Close()
 	initializeObjectGuidCache(db)
 	server := initializeServer(db)
+	go reapAuthedConns()
 	go server.ListenAndServe(string(*listenAddr))
 	ch := make(chan os.Signal)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
@@ -313,9 +316,16 @@ func main() {
 	server.Stop()
 }
 
+// usernameRe matches a syntactically valid mailbox address: a non-empty local
+// part of conservative characters, an '@', and a domain with at least one dot
+// and a 2+ character TLD. It is fully anchored so the whole string must match —
+// the previous unanchored pattern accepted any string that merely contained an
+// '@', which let crafted values (LDAP/SQL metacharacters, control bytes, empty
+// local parts) pass the validation gate.
+var usernameRe = regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`)
+
 func validateUsername(username string) bool {
-	result, _ := regexp.MatchString("[a-zA-Z0-9-_.]*@[a-zA-Z0-9-.]", username)
-	return result
+	return usernameRe.MatchString(username)
 }
 
 func getDatabase() *sql.DB {
@@ -479,15 +489,79 @@ func DnToMailbox(dn string) (string, bool) {
 	return "", false
 }
 
+// authedConns tracks LDAP connections that have completed a successful simple
+// bind, keyed by the per-connection Numero assigned by the ldapserver library.
+// handleSearch refuses to serve directory entries to connections that are not
+// present here, so an unauthenticated peer cannot enumerate every mailbox.
+//
+// The ldapserver library exposes no connection-close callback, so entries
+// cannot be removed deterministically on disconnect. Instead each entry records
+// the time of the connection's last request; reapAuthedConns periodically drops
+// entries idle longer than authIdleTimeout. A connection that closed will never
+// refresh its entry and is reaped; an active connection refreshes it on every
+// request. The map therefore stays bounded by the number of recently-active
+// connections rather than growing for the lifetime of the process.
+const authIdleTimeout = 1 * time.Hour
+
+var (
+	authedMu    sync.Mutex
+	authedConns = make(map[int]time.Time)
+)
+
+func markAuthenticated(numero int) {
+	authedMu.Lock()
+	authedConns[numero] = time.Now()
+	authedMu.Unlock()
+}
+
+func clearAuthenticated(numero int) {
+	authedMu.Lock()
+	delete(authedConns, numero)
+	authedMu.Unlock()
+}
+
+// isAuthenticated reports whether the connection has a live successful bind and,
+// as a side effect, refreshes its idle timer so active connections are not
+// reaped.
+func isAuthenticated(numero int) bool {
+	authedMu.Lock()
+	defer authedMu.Unlock()
+	if _, ok := authedConns[numero]; !ok {
+		return false
+	}
+	authedConns[numero] = time.Now()
+	return true
+}
+
+func reapAuthedConns() {
+	for {
+		time.Sleep(authIdleTimeout)
+		cutoff := time.Now().Add(-authIdleTimeout)
+		authedMu.Lock()
+		for numero, seen := range authedConns {
+			if seen.Before(cutoff) {
+				delete(authedConns, numero)
+			}
+		}
+		authedMu.Unlock()
+	}
+}
+
 func (s *LDAPServer) handleBind(w ldap.ResponseWriter, m *ldap.Message) {
 	r := m.GetBindRequest()
 	res := ldap.NewBindResponse(ldap.LDAPResultSuccess)
 	username := string(r.Name())
 
+	// Any (re)bind attempt invalidates a previously authenticated state on this
+	// connection so a failed or anonymous rebind cannot retain access.
+	clearAuthenticated(m.Client.Numero)
+
 	if r.AuthenticationChoice() == "simple" {
 		mailbox, valid_dn := DnToMailbox(username)
 		if !valid_dn {
 			log.Printf("Invalid DN: %s", username)
+			res.SetResultCode(ldap.LDAPResultInvalidCredentials)
+			res.SetDiagnosticMessage("invalid credentials")
 		} else {
 			user_password := fmt.Sprintf("%s", r.Authentication())
 			if *debugMode == "true" {
@@ -542,6 +616,7 @@ func (s *LDAPServer) handleBind(w ldap.ResponseWriter, m *ldap.Message) {
 			}
 
 			if authenticated {
+				markAuthenticated(m.Client.Numero)
 				log.Printf("Authentication successful: email=%s backend=%s", mailbox, backend)
 			} else {
 				log.Printf("Authentication failed: email=%s backend=%s", mailbox, backend)
@@ -577,6 +652,15 @@ func ExtractFilterValue(attribute string, filter string) (string, error) {
 
 func (s *LDAPServer) handleSearch(w ldap.ResponseWriter, m *ldap.Message) {
 	r := m.GetSearchRequest()
+
+	// Require a successful bind on this connection before returning any mailbox
+	// data; otherwise an unauthenticated peer could enumerate the directory.
+	if !isAuthenticated(m.Client.Numero) {
+		log.Printf("Rejecting unauthenticated search from %s", m.Client.Addr())
+		res := ldap.NewSearchResultDoneResponse(ldap.LDAPResultInsufficientAccessRights)
+		w.Write(res)
+		return
+	}
 
 	if *debugMode == "true" {
 		log.Printf("Request FilterString=%s", r.FilterString())
